@@ -28,7 +28,7 @@ RENDER_URL = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "").rstrip("/") or RENDER_URL
 WEBHOOK_PATH = "/webhook"
 CONCURRENCY = int(os.environ.get("CONCURRENCY", "3"))
-MAX_CARDS = int(os.environ.get("MAX_CARDS", "500"))
+MAX_CARDS = int(os.environ.get("MAX_CARDS", "50000"))
 
 BOT_NAME = "OGGY ST AUTHH"
 
