@@ -1,4 +1,4 @@
-# OGGY ST AUTHH — telegram bot (webhook, render-ready)
+# OGGY ST AUTHH — telegram bot (webhook, high-performance queue workers)
 import os
 import io
 import asyncio
@@ -28,8 +28,10 @@ WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "oggy_" + os.urandom(6).hex())
 RENDER_URL = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "").rstrip("/") or RENDER_URL
 WEBHOOK_PATH = "/webhook"
-CONCURRENCY = int(os.environ.get("CONCURRENCY", "3"))
-MAX_CARDS = int(os.environ.get("MAX_CARDS", "50000"))
+
+# 30 concurrent workers per batch. Global cap in checker.py keeps total safe.
+CONCURRENCY = int(os.environ.get("CONCURRENCY", "30"))
+MAX_CARDS = int(os.environ.get("MAX_CARDS", "100000"))
 
 BOT_NAME = "OGGY ST AUTHH"
 
@@ -75,12 +77,11 @@ def _emoji_for(resp: str) -> str:
 
 
 def _format_hit_log(card: str, resp: str, dt: float, idx: int) -> str:
-    """Clean HTML log block for a hit, with tappable/copyable card."""
     emoji = _emoji_for(resp)
     safe_card = card.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
     safe_resp = resp.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-    
     ts = datetime.now().strftime("%H:%M:%S")
+    
     return (
         f"{emoji} <b>HIT DETECTED</b> {emoji}\n"
         f"━━━━━━━━━━━━━━━━━━━━━\n"
@@ -97,21 +98,31 @@ def _format_hit_log(card: str, resp: str, dt: float, idx: int) -> str:
     )
 
 
-# -- batch runner -----------------------------------------------------------
+# -- queue-based batch runner -----------------------------------------------
 
 async def _run_batch(cards, progress_cb, hit_cb):
     total = len(cards)
-    sem = asyncio.Semaphore(CONCURRENCY)
+    queue = asyncio.Queue()
+    
+    for c in cards:
+        queue.put_nowait(c)
+        
     hits, all_results = [], []
     done = {"n": 0}
-
-    async def worker(card):
-        async with sem:
+    
+    async def worker():
+        while True:
+            try:
+                card = queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+                
             t0 = time.time()
             try:
                 res = await stripe_auth2_check(card, None)
             except Exception as e:
                 res = {"Response": f"err: {e}", "Gateway": "Stripe-Auth2", "Price": "$0"}
+                
             dt = time.time() - t0
             resp = res.get("Response", "?")
             
@@ -131,8 +142,12 @@ async def _run_batch(cards, progress_cb, hit_cb):
                 await progress_cb(idx, total, len(hits))
             except Exception:
                 pass
+                
+            queue.task_done()
 
-    await asyncio.gather(*(worker(c) for c in cards))
+    # Launch up to `CONCURRENCY` workers simultaneously
+    workers = [asyncio.create_task(worker()) for _ in range(min(CONCURRENCY, total))]
+    await asyncio.gather(*workers)
     return hits, all_results
 
 
@@ -145,7 +160,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"send a single card:\n"
         f"<code>cc|mm|yy|cvv</code>\n\n"
         f"or send a .txt file (one card per line)\n\n"
-        f"limit: {MAX_CARDS:,} cards · concurrency {CONCURRENCY}\n"
+        f"limit: {MAX_CARDS:,} cards · workers {CONCURRENCY}\n"
         f"use /help for more.",
         parse_mode="HTML",
     )
@@ -243,7 +258,6 @@ async def on_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             pass
 
     async def broadcast_hit(card, resp, dt, idx):
-        """Fire immediately when a hit is found during mass check."""
         try:
             await update.message.reply_text(
                 _format_hit_log(card, resp, dt, idx),
@@ -333,8 +347,7 @@ async def on_shutdown(app: web.Application):
 def main():
     log.info("starting %s", BOT_NAME)
     
-    # concurrent_updates(True) allows user A and user B to check at the same time.
-    # without this, telegram processes strictly one message at a time across all users.
+    # concurrent_updates(True) ensures users don't block each other
     tg_app = (
         Application.builder()
         .token(TOKEN)
