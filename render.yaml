@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: oggy-st-authh
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    envVars:
+      - key: BOT_TOKEN
+        value: 8864619886:AAFaQSwFV9MmDppZ7TTc1jMSOG6-OP2fYas
+      - key: WEBHOOK_SECRET
+        generateValue: true
+      - key: CONCURRENCY
+        value: "3"
+      - key: MAX_CARDS
+        value: "500"
+      - key: PYTHON_VERSION
+        value: "3.11.9"
