@@ -11,7 +11,7 @@ services:
       - key: WEBHOOK_SECRET
         generateValue: true
       - key: CONCURRENCY
-        value: "30"
+        value: "50"
       - key: MAX_CARDS
         value: "100000"
       - key: PYTHON_VERSION
