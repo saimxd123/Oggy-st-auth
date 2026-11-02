@@ -3,7 +3,6 @@ import os
 import io
 import asyncio
 import logging
-import random
 import time
 
 from aiohttp import web
@@ -44,7 +43,8 @@ def _parse_cards(raw: bytes):
     out = []
     for line in text.splitlines():
         s = line.strip()
-        if not s or s.startswith("#"): continue
+        if not s or s.startswith("#"):
+            continue
         if s.count("|") == 3:
             out.append(s)
     return out[:MAX_CARDS]
@@ -52,7 +52,8 @@ def _parse_cards(raw: bytes):
 
 def _is_hit(resp: str) -> bool:
     rl = resp.lower()
-    if "all sites failed" in rl: return False
+    if "all sites failed" in rl:
+        return False
     return any(k in rl for k in (
         "payment method added", "3ds challenge",
         "ccn live", "insufficient_funds", "incorrect_cvc",
@@ -116,7 +117,8 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def on_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     doc = update.message.document
-    if not doc: return
+    if not doc:
+        return
     if not (doc.file_name or "").lower().endswith(".txt"):
         await update.message.reply_text("send a .txt file.")
         return
@@ -140,6 +142,7 @@ async def on_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await status.edit_text(f"checking {len(cards)} cards… 0/{len(cards)}")
 
     last_edit = {"t": 0.0}
+
     async def progress(done, total, hit_count):
         now = time.time()
         if now - last_edit["t"] < 2.0 and done != total:
@@ -156,11 +159,12 @@ async def on_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     hits, all_results = await _run_batch(cards, progress)
     dt = time.time() - t0
 
+    # full results — encode() so the em-dash is fine
     out = io.BytesIO()
-    out.write(b"# OGGY ST AUTHH — full results\n")
-    out.write(b"# card | response | time_s\n")
+    out.write("# OGGY ST AUTHH — full results\n".encode("utf-8"))
+    out.write("# card | response | time_s\n".encode("utf-8"))
     for card, resp, secs in all_results:
-        out.write(f"{card} | {resp} | {secs:.1f}s\n".encode())
+        out.write(f"{card} | {resp} | {secs:.1f}s\n".encode("utf-8"))
     out.seek(0)
 
     summary = (
@@ -172,9 +176,9 @@ async def on_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if hits:
         hb = io.BytesIO()
-        hb.write(b"# OGGY ST AUTHH — hits\n")
+        hb.write("# OGGY ST AUTHH — hits\n".encode("utf-8"))
         for card, resp in hits:
-            hb.write(f"{card} | {resp}\n".encode())
+            hb.write(f"{card} | {resp}\n".encode("utf-8"))
         hb.seek(0)
         await update.message.reply_document(
             document=hb, filename="hits.txt",
