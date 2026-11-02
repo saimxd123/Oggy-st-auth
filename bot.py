@@ -1,4 +1,4 @@
-# OGGY ST AUTHH — telegram bot (webhook, high-performance queue workers)
+# OGGY ST AUTHH — telegram bot (webhook, high-performance, multi-user)
 import os
 import io
 import asyncio
@@ -29,11 +29,18 @@ RENDER_URL = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "").rstrip("/") or RENDER_URL
 WEBHOOK_PATH = "/webhook"
 
-# 30 concurrent workers per batch. Global cap in checker.py keeps total safe.
-CONCURRENCY = int(os.environ.get("CONCURRENCY", "30"))
+CONCURRENCY = int(os.environ.get("CONCURRENCY", "50"))
 MAX_CARDS = int(os.environ.get("MAX_CARDS", "100000"))
 
 BOT_NAME = "OGGY ST AUTHH"
+
+# Per-user locks to ensure User A doesn't starve User B
+USER_SEMS = {}
+
+def get_user_sem(user_id: int) -> asyncio.Semaphore:
+    if user_id not in USER_SEMS:
+        USER_SEMS[user_id] = asyncio.Semaphore(30)
+    return USER_SEMS[user_id]
 
 
 # -- helpers ----------------------------------------------------------------
@@ -100,13 +107,13 @@ def _format_hit_log(card: str, resp: str, dt: float, idx: int) -> str:
 
 # -- queue-based batch runner -----------------------------------------------
 
-async def _run_batch(cards, progress_cb, hit_cb):
+async def _run_batch(user_id, cards, progress_cb, hit_cb):
     total = len(cards)
     queue = asyncio.Queue()
-    
     for c in cards:
         queue.put_nowait(c)
         
+    user_sem = get_user_sem(user_id)
     hits, all_results = [], []
     done = {"n": 0}
     
@@ -118,10 +125,12 @@ async def _run_batch(cards, progress_cb, hit_cb):
                 break
                 
             t0 = time.time()
-            try:
-                res = await stripe_auth2_check(card, None)
-            except Exception as e:
-                res = {"Response": f"err: {e}", "Gateway": "Stripe-Auth2", "Price": "$0"}
+            # limit per-user concurrency
+            async with user_sem:
+                try:
+                    res = await stripe_auth2_check(card, None)
+                except Exception as e:
+                    res = {"Response": f"err: {e}", "Gateway": "Stripe-Auth2", "Price": "$0"}
                 
             dt = time.time() - t0
             resp = res.get("Response", "?")
@@ -160,7 +169,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"send a single card:\n"
         f"<code>cc|mm|yy|cvv</code>\n\n"
         f"or send a .txt file (one card per line)\n\n"
-        f"limit: {MAX_CARDS:,} cards · workers {CONCURRENCY}\n"
+        f"limit: {MAX_CARDS:,} cards\n"
         f"use /help for more.",
         parse_mode="HTML",
     )
@@ -192,11 +201,15 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     status = await update.message.reply_text("checking…")
     t0 = time.time()
+    
+    user_sem = get_user_sem(update.effective_user.id)
     try:
-        res = await stripe_auth2_check(text, None)
+        async with user_sem:
+            res = await stripe_auth2_check(text, None)
     except Exception as e:
         await status.edit_text(f"err: {e}")
         return
+        
     dt = time.time() - t0
     resp = res.get("Response", "?")
     
@@ -267,7 +280,7 @@ async def on_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             log.error("broadcast_hit error: %s", e)
 
     t0 = time.time()
-    hits, all_results = await _run_batch(cards, progress, broadcast_hit)
+    hits, all_results = await _run_batch(update.effective_user.id, cards, progress, broadcast_hit)
     dt = time.time() - t0
 
     out = io.BytesIO()
@@ -304,6 +317,13 @@ async def on_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 # -- web plumbing -----------------------------------------------------------
 
+async def process_update_safe(app, update):
+    try:
+        await app.process_update(update)
+    except Exception as e:
+        log.error(f"Update processing error: {e}", exc_info=True)
+
+
 async def webhook_handler(request: web.Request):
     try:
         data = await request.json()
@@ -312,10 +332,8 @@ async def webhook_handler(request: web.Request):
     app: Application = request.app["tg_app"]
     update = Update.de_json(data, app.bot)
     
-    # PTB bypasses Updater here, so we must manually process the update.
-    # create_task ensures we don't block the webhook response.
-    asyncio.create_task(app.process_update(update))
-    
+    # Spawn as a task so it never blocks the webhook response
+    asyncio.create_task(process_update_safe(app, update))
     return web.Response(text="ok")
 
 
