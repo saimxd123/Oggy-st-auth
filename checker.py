@@ -13,8 +13,9 @@ try:
 except ImportError:
     HAS_SOCKS = False
 
-# Global max connections across the ENTIRE bot (all users combined).
-GLOBAL_SEM = asyncio.Semaphore(300)
+# Global max connections across the ENTIRE bot.
+# High compute plan can handle this easily.
+GLOBAL_SEM = asyncio.Semaphore(1000)
 
 SITES = [
     "https://innercitytigers.com",
