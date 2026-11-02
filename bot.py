@@ -1,4 +1,4 @@
-# OGGY ST AUTHH — telegram bot (webhook, high-performance, multi-user, /stop)
+# OGGY ST AUTHH — telegram bot (webhook, multi-user, /stop, /ping)
 import os
 import io
 import asyncio
@@ -18,12 +18,13 @@ logging.basicConfig(
 )
 log = logging.getLogger("OGGY")
 
-DEFAULT_TOKEN = "8864619886:AAFk9JheVoMoct6-ASop9f0oiz400ITEDVk"
+# Fallback token if env var is missing
+DEFAULT_TOKEN = "8864619886:AAFaQSwFV9MmDppZ7TTc1jMSOG6-OP2fYas"
 TOKEN = os.environ.get("BOT_TOKEN", DEFAULT_TOKEN).strip()
 if not TOKEN:
     raise SystemExit("BOT_TOKEN missing")
 
-PORT = int(os.environ.get("PORT", "8080"))
+PORT = int(os.environ.get("PORT", "10000"))
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "oggy_" + os.urandom(6).hex())
 RENDER_URL = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "").rstrip("/") or RENDER_URL
@@ -34,7 +35,6 @@ MAX_CARDS = int(os.environ.get("MAX_CARDS", "100000"))
 
 BOT_NAME = "OGGY ST AUTHH"
 
-# Per-user locks and task tracking
 USER_SEMS = {}
 USER_TASKS = {}
 
@@ -106,7 +106,7 @@ def _format_hit_log(card: str, resp: str, dt: float, idx: int) -> str:
     )
 
 
-# -- queue-based batch runner -----------------------------------------------
+# -- batch runner -----------------------------------------------------------
 
 async def _run_batch(user_id, cards, progress_cb, hit_cb):
     total = len(cards)
@@ -172,6 +172,8 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         parse_mode="HTML",
     )
 
+async def cmd_ping(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("pong 🏓 — bot is online and responding.")
 
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -186,10 +188,10 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"commands:\n"
         f"/start — intro\n"
         f"/stop — cancel current run\n"
+        f"/ping — check if bot is alive\n"
         f"/help — this",
         parse_mode="HTML",
     )
-
 
 async def cmd_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -201,7 +203,7 @@ async def cmd_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("no active session found.")
 
 
-# -- single card ------------------------------------------------------------
+# -- handlers ---------------------------------------------------------------
 
 async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
@@ -232,8 +234,6 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     finally:
         USER_TASKS.pop(user_id, None)
 
-
-# -- file upload ------------------------------------------------------------
 
 SPIN = ["⏳", "⌛", "🔄", "⏳", "⌛", "🔄"]
 
@@ -342,15 +342,24 @@ async def on_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 # -- web plumbing -----------------------------------------------------------
 
+async def process_update_safe(app, update):
+    try:
+        await app.process_update(update)
+    except Exception as e:
+        log.error(f"Update processing error: {e}", exc_info=True)
+
 async def webhook_handler(request: web.Request):
     try:
         data = await request.json()
-    except Exception:
+    except Exception as e:
         return web.Response(status=400)
+    
     app: Application = request.app["tg_app"]
     update = Update.de_json(data, app.bot)
     
-    asyncio.create_task(app.process_update(update))
+    if update:
+        asyncio.create_task(process_update_safe(app, update))
+        
     return web.Response(text="ok")
 
 
@@ -362,14 +371,19 @@ async def on_startup(app: web.Application):
     tg: Application = app["tg_app"]
     await tg.initialize()
     await tg.start()
+    
     if WEBHOOK_URL:
         wh_url = f"{WEBHOOK_URL}{WEBHOOK_PATH}"
-        await tg.bot.set_webhook(
-            url=wh_url, secret_token=WEBHOOK_SECRET, drop_pending_updates=True
-        )
-        log.info("%s webhook set: %s", BOT_NAME, wh_url)
+        try:
+            await tg.bot.set_webhook(
+                url=wh_url, secret_token=WEBHOOK_SECRET, drop_pending_updates=True
+            )
+            log.info("%s webhook set: %s", BOT_NAME, wh_url)
+        except Exception as e:
+            log.error(f"Failed to set webhook: {e}", exc_info=True)
     else:
         log.warning("WEBHOOK_URL / RENDER_EXTERNAL_URL unset — webhook not registered")
+    
     log.info("%s ready on :%s", BOT_NAME, PORT)
 
 
@@ -390,12 +404,12 @@ def main():
         Application.builder()
         .token(TOKEN)
         .updater(None)
-        .concurrent_updates(True) 
         .build()
     )
     
     tg_app.add_handler(CommandHandler("start", cmd_start))
     tg_app.add_handler(CommandHandler("help", cmd_help))
+    tg_app.add_handler(CommandHandler("ping", cmd_ping))
     tg_app.add_handler(CommandHandler("stop", cmd_stop))
     tg_app.add_handler(MessageHandler(filters.Document.ALL, on_document))
     tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
