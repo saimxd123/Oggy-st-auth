@@ -311,7 +311,11 @@ async def webhook_handler(request: web.Request):
         return web.Response(status=400)
     app: Application = request.app["tg_app"]
     update = Update.de_json(data, app.bot)
-    await app.update_queue.put(update)
+    
+    # PTB bypasses Updater here, so we must manually process the update.
+    # create_task ensures we don't block the webhook response.
+    asyncio.create_task(app.process_update(update))
+    
     return web.Response(text="ok")
 
 
