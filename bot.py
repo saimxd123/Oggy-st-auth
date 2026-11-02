@@ -1,4 +1,4 @@
-# OGGY ST AUTHH — telegram bot (webhook, high-performance, multi-user)
+# OGGY ST AUTHH — telegram bot (webhook, high-performance, multi-user, /stop)
 import os
 import io
 import asyncio
@@ -34,8 +34,9 @@ MAX_CARDS = int(os.environ.get("MAX_CARDS", "100000"))
 
 BOT_NAME = "OGGY ST AUTHH"
 
-# Per-user locks to ensure User A doesn't starve User B
+# Per-user locks and task tracking
 USER_SEMS = {}
+USER_TASKS = {}
 
 def get_user_sem(user_id: int) -> asyncio.Semaphore:
     if user_id not in USER_SEMS:
@@ -125,7 +126,6 @@ async def _run_batch(user_id, cards, progress_cb, hit_cb):
                 break
                 
             t0 = time.time()
-            # limit per-user concurrency
             async with user_sem:
                 try:
                     res = await stripe_auth2_check(card, None)
@@ -137,15 +137,14 @@ async def _run_batch(user_id, cards, progress_cb, hit_cb):
             
             done["n"] += 1
             idx = done["n"]
-            
             all_results.append((card, resp, dt))
             
             if _is_hit(resp):
                 hits.append((card, resp))
                 try:
                     await hit_cb(card, resp, dt, idx)
-                except Exception as e:
-                    log.error("hit_cb failed: %s", e)
+                except Exception:
+                    pass
                     
             try:
                 await progress_cb(idx, total, len(hits))
@@ -154,7 +153,6 @@ async def _run_batch(user_id, cards, progress_cb, hit_cb):
                 
             queue.task_done()
 
-    # Launch up to `CONCURRENCY` workers simultaneously
     workers = [asyncio.create_task(worker()) for _ in range(min(CONCURRENCY, total))]
     await asyncio.gather(*workers)
     return hits, all_results
@@ -187,9 +185,20 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"• max cards per run: {MAX_CARDS:,}\n\n"
         f"commands:\n"
         f"/start — intro\n"
+        f"/stop — cancel current run\n"
         f"/help — this",
         parse_mode="HTML",
     )
+
+
+async def cmd_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    task = USER_TASKS.get(user_id)
+    if task and not task.done():
+        task.cancel()
+        await update.message.reply_text("🛑 stopping your current session…")
+    else:
+        await update.message.reply_text("no active session found.")
 
 
 # -- single card ------------------------------------------------------------
@@ -199,24 +208,29 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if text.count("|") != 3:
         return
 
+    user_id = update.effective_user.id
     status = await update.message.reply_text("checking…")
-    t0 = time.time()
     
-    user_sem = get_user_sem(update.effective_user.id)
+    USER_TASKS[user_id] = asyncio.current_task()
+    
     try:
+        t0 = time.time()
+        user_sem = get_user_sem(user_id)
         async with user_sem:
             res = await stripe_auth2_check(text, None)
+        dt = time.time() - t0
+        resp = res.get("Response", "?")
+        
+        await status.edit_text(
+            _format_hit_log(text, resp, dt, 1),
+            parse_mode="HTML"
+        )
+    except asyncio.CancelledError:
+        await status.edit_text("🛑 session stopped.")
     except Exception as e:
         await status.edit_text(f"err: {e}")
-        return
-        
-    dt = time.time() - t0
-    resp = res.get("Response", "?")
-    
-    await status.edit_text(
-        _format_hit_log(text, resp, dt, 1),
-        parse_mode="HTML"
-    )
+    finally:
+        USER_TASKS.pop(user_id, None)
 
 
 # -- file upload ------------------------------------------------------------
@@ -224,6 +238,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 SPIN = ["⏳", "⌛", "🔄", "⏳", "⌛", "🔄"]
 
 async def on_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
     doc = update.message.document
     if not doc:
         return
@@ -276,53 +291,56 @@ async def on_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 _format_hit_log(card, resp, dt, idx),
                 parse_mode="HTML"
             )
-        except Exception as e:
-            log.error("broadcast_hit error: %s", e)
+        except Exception:
+            pass
 
-    t0 = time.time()
-    hits, all_results = await _run_batch(update.effective_user.id, cards, progress, broadcast_hit)
-    dt = time.time() - t0
+    USER_TASKS[user_id] = asyncio.current_task()
+    try:
+        t0 = time.time()
+        hits, all_results = await _run_batch(user_id, cards, progress, broadcast_hit)
+        dt = time.time() - t0
 
-    out = io.BytesIO()
-    out.write(f"# {BOT_NAME} — full results\n".encode("utf-8"))
-    out.write("# card | response | time_s\n".encode("utf-8"))
-    for card, resp, secs in all_results:
-        out.write(f"{card} | {resp} | {secs:.1f}s\n".encode("utf-8"))
-    out.seek(0)
+        out = io.BytesIO()
+        out.write(f"# {BOT_NAME} — full results\n".encode("utf-8"))
+        out.write("# card | response | time_s\n".encode("utf-8"))
+        for card, resp, secs in all_results:
+            out.write(f"{card} | {resp} | {secs:.1f}s\n".encode("utf-8"))
+        out.seek(0)
 
-    summary = (
-        f"✅ <b>{BOT_NAME} — done</b>\n"
-        f"⏱ time: {dt:.1f}s\n"
-        f"📊 checked: {len(cards):,}\n"
-        f"💚 hits: {len(hits):,}"
-    )
-    await status.edit_text(summary, parse_mode="HTML")
-
-    if hits:
-        hb = io.BytesIO()
-        hb.write(f"# {BOT_NAME} — hits\n".encode("utf-8"))
-        for card, resp in hits:
-            hb.write(f"{card} | {resp}\n".encode("utf-8"))
-        hb.seek(0)
-        await update.message.reply_document(
-            document=hb, filename="hits.txt",
-            caption=f"💚 {len(hits)} hit(s)",
+        summary = (
+            f"✅ <b>{BOT_NAME} — done</b>\n"
+            f"⏱ time: {dt:.1f}s\n"
+            f"📊 checked: {len(cards):,}\n"
+            f"💚 hits: {len(hits):,}"
         )
+        await status.edit_text(summary, parse_mode="HTML")
 
-    await update.message.reply_document(
-        document=out, filename="results.txt",
-        caption=f"📄 full results — {len(cards):,} checked",
-    )
+        if hits:
+            hb = io.BytesIO()
+            hb.write(f"# {BOT_NAME} — hits\n".encode("utf-8"))
+            for card, resp in hits:
+                hb.write(f"{card} | {resp}\n".encode("utf-8"))
+            hb.seek(0)
+            await update.message.reply_document(
+                document=hb, filename="hits.txt",
+                caption=f"💚 {len(hits)} hit(s)",
+            )
+
+        await update.message.reply_document(
+            document=out, filename="results.txt",
+            caption=f"📄 full results — {len(cards):,} checked",
+        )
+        
+    except asyncio.CancelledError:
+        await status.edit_text("🛑 session stopped.")
+    except Exception as e:
+        log.error(f"Batch error: {e}", exc_info=True)
+        await status.edit_text(f"❌ error: {e}")
+    finally:
+        USER_TASKS.pop(user_id, None)
 
 
 # -- web plumbing -----------------------------------------------------------
-
-async def process_update_safe(app, update):
-    try:
-        await app.process_update(update)
-    except Exception as e:
-        log.error(f"Update processing error: {e}", exc_info=True)
-
 
 async def webhook_handler(request: web.Request):
     try:
@@ -332,8 +350,7 @@ async def webhook_handler(request: web.Request):
     app: Application = request.app["tg_app"]
     update = Update.de_json(data, app.bot)
     
-    # Spawn as a task so it never blocks the webhook response
-    asyncio.create_task(process_update_safe(app, update))
+    asyncio.create_task(app.process_update(update))
     return web.Response(text="ok")
 
 
@@ -369,7 +386,6 @@ async def on_shutdown(app: web.Application):
 def main():
     log.info("starting %s", BOT_NAME)
     
-    # concurrent_updates(True) ensures users don't block each other
     tg_app = (
         Application.builder()
         .token(TOKEN)
@@ -380,6 +396,7 @@ def main():
     
     tg_app.add_handler(CommandHandler("start", cmd_start))
     tg_app.add_handler(CommandHandler("help", cmd_help))
+    tg_app.add_handler(CommandHandler("stop", cmd_stop))
     tg_app.add_handler(MessageHandler(filters.Document.ALL, on_document))
     tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
