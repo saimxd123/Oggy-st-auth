@@ -332,7 +332,17 @@ async def on_shutdown(app: web.Application):
 
 def main():
     log.info("starting %s", BOT_NAME)
-    tg_app = Application.builder().token(TOKEN).updater(None).build()
+    
+    # concurrent_updates(True) allows user A and user B to check at the same time.
+    # without this, telegram processes strictly one message at a time across all users.
+    tg_app = (
+        Application.builder()
+        .token(TOKEN)
+        .updater(None)
+        .concurrent_updates(True) 
+        .build()
+    )
+    
     tg_app.add_handler(CommandHandler("start", cmd_start))
     tg_app.add_handler(CommandHandler("help", cmd_help))
     tg_app.add_handler(MessageHandler(filters.Document.ALL, on_document))
