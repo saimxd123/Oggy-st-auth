@@ -13,6 +13,6 @@ services:
       - key: CONCURRENCY
         value: "3"
       - key: MAX_CARDS
-        value: "500"
+        value: "50000"
       - key: PYTHON_VERSION
         value: "3.11.9"
