@@ -18,7 +18,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("OGGY")
 
-DEFAULT_TOKEN = "8864619886:AAFk9JheVoMoct6-ASop9f0oiz400ITEDVk-OP2fYas"
+DEFAULT_TOKEN = "8864619886:AAFk9JheVoMoct6-ASop9f0oiz400ITEDVk"
 TOKEN = os.environ.get("BOT_TOKEN", DEFAULT_TOKEN).strip()
 if not TOKEN:
     raise SystemExit("BOT_TOKEN missing")
