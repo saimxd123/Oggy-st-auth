@@ -1,4 +1,4 @@
-# checker.py — optimized with shared connection pool to prevent port exhaustion
+# checker.py — optimized, no shared connector (fixes event loop deadlock)
 import re
 import uuid
 import string
@@ -37,9 +37,7 @@ NONCE_PATTERNS = [
 ]
 
 BAD_RESPONSES = {"", "0", "null", "false", "-1", "undefined"}
-
 PK_CACHE = {}
-_CONNECTOR = None
 
 
 def _rand_str(n=10):
@@ -70,16 +68,11 @@ def _is_bad_body(text):
 
 
 def _make_session(proxy_url, jar, timeout):
-    global _CONNECTOR
-    if _CONNECTOR is None:
-        # Shared pool limits total sockets Render has to manage
-        _CONNECTOR = aiohttp.TCPConnector(limit=500, limit_per_host=50, ssl=False, force_close=False)
-        
     if proxy_url and proxy_url.startswith(("socks5://", "socks5h://", "socks4://")):
         if not HAS_SOCKS: raise RuntimeError("aiohttp_socks required")
         return aiohttp.ClientSession(timeout=timeout, cookie_jar=jar,
                                      connector=ProxyConnector.from_url(proxy_url))
-    return aiohttp.ClientSession(timeout=timeout, cookie_jar=jar, connector=_CONNECTOR)
+    return aiohttp.ClientSession(timeout=timeout, cookie_jar=jar)
 
 
 def _req_proxy(proxy_url):
@@ -272,32 +265,36 @@ def _classify(text):
     return {"Response": clean, "Gateway": "Stripe-Auth2", "Price": "$0"}
 
 
+async def _stripe_auth2_check_inner(card_str, proxy_str=None):
+    parts = card_str.strip().split('|')
+    if len(parts) != 4:
+        return {"Response": "Invalid card format", "Gateway": "Stripe-Auth2", "Price": "$0"}
+    cc, mm, yy, cvv = (p.strip() for p in parts)
+    cc = cc.replace(' ', '')
+    mm = mm.zfill(2)
+    if len(yy) == 2: yy = '20' + yy
+
+    proxy_url = proxy_str if proxy_str else None
+    sites = list(SITES)
+    random.shuffle(sites)
+
+    for site_url in sites:
+        try:
+            result = await _try_site(site_url, cc, mm, yy, cvv, proxy_url)
+            if result and not _is_bad_body(result.get("Response", "")):
+                return result
+        except Exception: 
+            continue
+
+    return {"Response": "All sites failed — no valid response", "Gateway": "Stripe-Auth2", "Price": "$0"}
+
+
 async def stripe_auth2_check(card_str, proxy_str=None):
     async with GLOBAL_SEM:
         try:
-            parts = card_str.strip().split('|')
-            if len(parts) != 4:
-                return {"Response": "Invalid card format", "Gateway": "Stripe-Auth2", "Price": "$0"}
-            cc, mm, yy, cvv = parts
-            cc = cc.strip().replace(' ', '')
-            mm = mm.strip().zfill(2)
-            yy = yy.strip()
-            cvv = cvv.strip()
-            if len(yy) == 2: yy = '20' + yy
-
-            proxy_url = proxy_str if proxy_str else None
-            sites = list(SITES)
-            random.shuffle(sites)
-
-            for site_url in sites:
-                try:
-                    result = await _try_site(site_url, cc, mm, yy, cvv, proxy_url)
-                    if result is None: continue
-                    if not isinstance(result, dict): continue
-                    if _is_bad_body(result.get("Response", "")): continue
-                    return result
-                except Exception: continue
-
-            return {"Response": "All sites failed — no valid response", "Gateway": "Stripe-Auth2", "Price": "$0"}
+            # absolute timeout of 45 seconds per card so nothing hangs forever
+            return await asyncio.wait_for(_stripe_auth2_check_inner(card_str, proxy_str), timeout=45.0)
+        except asyncio.TimeoutError:
+            return {"Response": "Check timed out", "Gateway": "Stripe-Auth2", "Price": "$0"}
         except Exception as e:
-            return {"Response": f"Exception: {str(e)[:80]}", "Gateway": "Stripe-Auth2", "Price": "$0"}
+            return {"Response": f"Error: {str(e)[:80]}", "Gateway": "Stripe-Auth2", "Price": "$0"}
