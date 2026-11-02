@@ -1,4 +1,4 @@
-# checker.py — optimized for high compute (queue worker pool, pk cache, global sem)
+# checker.py — optimized with shared connection pool to prevent port exhaustion
 import re
 import uuid
 import string
@@ -14,8 +14,7 @@ except ImportError:
     HAS_SOCKS = False
 
 # Global max connections across the ENTIRE bot.
-# High compute plan can handle this easily.
-GLOBAL_SEM = asyncio.Semaphore(1000)
+GLOBAL_SEM = asyncio.Semaphore(500)
 
 SITES = [
     "https://innercitytigers.com",
@@ -39,8 +38,8 @@ NONCE_PATTERNS = [
 
 BAD_RESPONSES = {"", "0", "null", "false", "-1", "undefined"}
 
-# Cache PK so we don't scrape the site every time
 PK_CACHE = {}
+_CONNECTOR = None
 
 
 def _rand_str(n=10):
@@ -71,11 +70,16 @@ def _is_bad_body(text):
 
 
 def _make_session(proxy_url, jar, timeout):
+    global _CONNECTOR
+    if _CONNECTOR is None:
+        # Shared pool limits total sockets Render has to manage
+        _CONNECTOR = aiohttp.TCPConnector(limit=500, limit_per_host=50, ssl=False, force_close=False)
+        
     if proxy_url and proxy_url.startswith(("socks5://", "socks5h://", "socks4://")):
         if not HAS_SOCKS: raise RuntimeError("aiohttp_socks required")
         return aiohttp.ClientSession(timeout=timeout, cookie_jar=jar,
                                      connector=ProxyConnector.from_url(proxy_url))
-    return aiohttp.ClientSession(timeout=timeout, cookie_jar=jar)
+    return aiohttp.ClientSession(timeout=timeout, cookie_jar=jar, connector=_CONNECTOR)
 
 
 def _req_proxy(proxy_url):
