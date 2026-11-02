@@ -18,7 +18,6 @@ logging.basicConfig(
 )
 log = logging.getLogger("OGGY")
 
-# Fallback token if env var is missing
 DEFAULT_TOKEN = "8864619886:AAFaQSwFV9MmDppZ7TTc1jMSOG6-OP2fYas"
 TOKEN = os.environ.get("BOT_TOKEN", DEFAULT_TOKEN).strip()
 if not TOKEN:
@@ -63,7 +62,7 @@ def _parse_cards(raw: bytes):
 
 def _is_hit(resp: str) -> bool:
     rl = resp.lower()
-    if "all sites failed" in rl:
+    if "all sites failed" in rl or "timed out" in rl:
         return False
     return any(k in rl for k in (
         "payment method added", "3ds challenge",
@@ -79,7 +78,7 @@ def _emoji_for(resp: str) -> str:
     if any(k in rl for k in ("declined", "expired", "not_supported", "do_not_honor",
                              "fraudulent", "stolen", "lost", "pickup", "restricted")):
         return "❌"
-    if "all sites failed" in rl or "empty ajax" in rl or "session mismatch" in rl:
+    if "all sites failed" in rl or "empty ajax" in rl or "session mismatch" in rl or "timed out" in rl:
         return "⚠️"
     return "ℹ️"
 
@@ -228,9 +227,11 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             parse_mode="HTML"
         )
     except asyncio.CancelledError:
-        await status.edit_text("🛑 session stopped.")
+        try: await status.edit_text("🛑 session stopped.")
+        except Exception: pass
     except Exception as e:
-        await status.edit_text(f"err: {e}")
+        try: await status.edit_text(f"err: {e}")
+        except Exception: pass
     finally:
         USER_TASKS.pop(user_id, None)
 
@@ -254,15 +255,18 @@ async def on_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         tg_file = await doc.get_file()
         raw = bytes(await tg_file.download_as_bytearray())
     except Exception as e:
-        await status.edit_text(f"download failed: {e}")
+        try: await status.edit_text(f"download failed: {e}")
+        except Exception: pass
         return
 
     cards = _parse_cards(raw)
     if not cards:
-        await status.edit_text("no valid cards found (need cc|mm|yy|cvv).")
+        try: await status.edit_text("no valid cards found (need cc|mm|yy|cvv).")
+        except Exception: pass
         return
 
-    await status.edit_text(f"🔎 checking {len(cards):,} cards…")
+    try: await status.edit_text(f"🔎 checking {len(cards):,} cards…")
+    except Exception: pass
 
     state = {"spin": 0, "last": 0.0}
 
@@ -313,7 +317,8 @@ async def on_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"📊 checked: {len(cards):,}\n"
             f"💚 hits: {len(hits):,}"
         )
-        await status.edit_text(summary, parse_mode="HTML")
+        try: await status.edit_text(summary, parse_mode="HTML")
+        except Exception: pass
 
         if hits:
             hb = io.BytesIO()
@@ -321,21 +326,27 @@ async def on_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             for card, resp in hits:
                 hb.write(f"{card} | {resp}\n".encode("utf-8"))
             hb.seek(0)
-            await update.message.reply_document(
-                document=hb, filename="hits.txt",
-                caption=f"💚 {len(hits)} hit(s)",
-            )
+            try:
+                await update.message.reply_document(
+                    document=hb, filename="hits.txt",
+                    caption=f"💚 {len(hits)} hit(s)",
+                )
+            except Exception: pass
 
-        await update.message.reply_document(
-            document=out, filename="results.txt",
-            caption=f"📄 full results — {len(cards):,} checked",
-        )
+        try:
+            await update.message.reply_document(
+                document=out, filename="results.txt",
+                caption=f"📄 full results — {len(cards):,} checked",
+            )
+        except Exception: pass
         
     except asyncio.CancelledError:
-        await status.edit_text("🛑 session stopped.")
+        try: await status.edit_text("🛑 session stopped.")
+        except Exception: pass
     except Exception as e:
         log.error(f"Batch error: {e}", exc_info=True)
-        await status.edit_text(f"❌ error: {e}")
+        try: await status.edit_text(f"❌ error: {e}")
+        except Exception: pass
     finally:
         USER_TASKS.pop(user_id, None)
 
@@ -351,7 +362,7 @@ async def process_update_safe(app, update):
 async def webhook_handler(request: web.Request):
     try:
         data = await request.json()
-    except Exception as e:
+    except Exception:
         return web.Response(status=400)
     
     app: Application = request.app["tg_app"]
@@ -369,9 +380,17 @@ async def health(_request):
 
 async def on_startup(app: web.Application):
     tg: Application = app["tg_app"]
-    await tg.initialize()
-    await tg.start()
-    
+    try:
+        await tg.initialize()
+        await tg.start()
+    except Exception as e:
+        log.error("=========================================")
+        log.error(f"❌ FATAL: TELEGRAM TOKEN REJECTED.")
+        log.error(f"ERROR: {e}")
+        log.error("Go to BotFather, revoke your old token, and update BOT_TOKEN in Render.")
+        log.error("=========================================")
+        return
+
     if WEBHOOK_URL:
         wh_url = f"{WEBHOOK_URL}{WEBHOOK_PATH}"
         try:
